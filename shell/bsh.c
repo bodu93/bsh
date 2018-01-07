@@ -21,17 +21,33 @@ enum builtins {
 
 void do_redirection(int stdinfd, int stdoutfd, int stderrfd) {
     if (stdinfd >= 0) {
-        dup2(stdinfd, STDIN_FILENO);
+        if (dup2(stdinfd, STDIN_FILENO) < 0) {
+            fprintf(stderr, "bsh: dup2 STDIN_FILENO failed %s\n",
+                    strerror(errno));
+            return;
+        }
+        /* ignore fail of close call
+         * when process terminated,
+         * all opened file descriptors will closed forcedly
+         */
         close(stdinfd);
     }
 
     if (stdoutfd >= 0) {
-        dup2(stdoutfd, STDOUT_FILENO);
+        if (dup2(stdoutfd, STDOUT_FILENO) < 0) {
+            fprintf(stderr, "bsh: dup2 STDOUT_FILENO failed %s\n",
+                    strerror(errno));
+            return;
+        }
         close(stdoutfd);
     }
 
     if (stderrfd >= 0) {
-        dup2(stderrfd, STDERR_FILENO);
+        if (dup2(stderrfd, STDERR_FILENO) < 0) {
+            fprintf(stderr, "bsh: dup2 STDERR_FILENO failed %s\n",
+                    strerror(errno));
+            return;
+        }
         close(stderrfd);
     }
 }
@@ -51,12 +67,15 @@ pid_t fork_and_execute(const struct pipe_command* command) {
 
     pid_t pid;
     if ((pid = fork()) < 0) {
+        fprintf(stderr, "bsh: fork error for %s.\n", strerror(errno));
         return -2; /* fork failed */
     } else if (pid == 0) {
         restore_signals();
 
         execute(command);
         fprintf(stderr, "bsh: execute %s error.\n", command->arglist[0]);
+        /* if support 'echo $?' command,
+         * may be should make exit value more clear... */
         exit(-1);
     }
     return pid;
@@ -96,6 +115,7 @@ pid_t execute_with_pipe(struct pipe_command** pipe_commands,
             pipe_commands[i]->stdoutfd = pipefd[1];
 
             grand_child_pid = fork_and_execute(pipe_commands[i]);
+            close(readfd);
             readfd = pipefd[0];
             close(pipefd[1]);
             if (grand_child_pid < 0) {

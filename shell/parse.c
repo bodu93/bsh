@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <errno.h>
 
 #include <strings.h>
 #include <string.h>
@@ -393,7 +394,11 @@ int parse_command_with_pipe(const char* cmd,
 int open_file(const struct string_view* file_sv, int openflag) {
     assert(file_sv);
 
-    if (file_sv->str == NULL) return -1;
+    /*
+     * return -2, just make difference with the wrong return value
+     * of system call open(2)
+     */
+    if (file_sv->str == NULL) return -2;
 
     char buf[1024];
     snprintf(buf, file_sv->len + 1, "%s", file_sv->str);
@@ -405,6 +410,10 @@ int open_file(const struct string_view* file_sv, int openflag) {
         fd = open(buf, openflag, 0666);
     } else {
         fd = open(buf, openflag);
+    }
+    /* handle open error */
+    if (fd < 0) {
+        fprintf(stderr, "bsh: open %s failed for %s.\n", buf, strerror(errno));
     }
     return fd;
 }
@@ -423,6 +432,15 @@ struct pipe_command* mk_pipecommand(const struct command_frag* cmdfrag) {
         } else {
             pcmd->stderrfd = open_file(&(cmdfrag->stderrfile),
                                        cmdfrag->stderrfile_openflag);
+        }
+
+        /* handle open error */
+        if (pcmd->stdinfd == -1 ||
+            pcmd->stdoutfd == -1 ||
+            pcmd->stderrfd == -1) {
+            /* no need to free arglist */
+            free(pcmd);
+            return NULL;
         }
 
         size_t i = 0;
@@ -455,14 +473,20 @@ int parse_execute(const char* cmd, size_t cmdlen) {
         return -1;
     }
 
-    /* translate command_frag to pipe_command */
+    /* transform command_frag into pipe_command */
     struct pipe_command* pipesarray[MAXPIPECOUNT + 2];
     size_t pipearrayslen = 0;
     
     for (size_t i = 0; i < MAXPIPECOUNT + 2; i++) {
         if (fragarray[i].stderr_to_stdout_flag != -1) {
-            pipesarray[pipearrayslen++] =
+            struct pipe_command* pipecmd = 
                 mk_pipecommand(fragarray + i);
+            if (pipecmd == NULL) { /* may be malloc failed or open failed */
+                /* free allocated memory */
+                free_memory(pipesarray, pipearrayslen);
+                return -1;
+            }
+            pipesarray[pipearrayslen++] = pipecmd;
         } else {
             break;
         }
