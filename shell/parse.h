@@ -13,6 +13,7 @@ struct command_frag {
     struct string_view stdoutfile;
     int                stdoutfile_openflag;
     struct string_view stderrfile;
+    int                stderrfile_openflag;
     int                stderr_to_stdout_flag;
     struct string_view arguments[ARGSMAXCOUNT];
 };

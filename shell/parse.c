@@ -13,6 +13,20 @@
 
 static const char SPLITSIGN     = ';';
 
+/*
+ * stdout or stderr redirection cases:
+ * >stdout_file
+ * >>stdout_file
+ * 2>stdout_file
+ * 2>>stdout_file
+ */
+enum output_redirection_cases {
+    WRONLY,
+    APPEND,
+    ERR_WRONLY,
+    ERR_APPEND
+};
+
 void parse_error(char ch) {
     fprintf(stderr, "bsh: parse error near '%c'.\n", ch);
 }
@@ -69,7 +83,8 @@ int parse_command_no_pipe(const struct string_view* cmdfrag,
     struct string_view input_file;
     int output_count = 0;
     struct string_view output_file;
-    int open_flag = 0;
+    int stdout_open_flag = 0;
+    int stderr_open_flag = 0;
     int err_max = 1;
     int err_count = 0;
     int stderr_to_stdout_flag = 0;
@@ -148,34 +163,35 @@ int parse_command_no_pipe(const struct string_view* cmdfrag,
                      * stdout redirection cases(at most 1):
                      * > out_file
                      * >out_file
+                     * >> out_file
+                     * >>out_file
+                     *
+                     * stderr redirection cases:
                      * 2>&1
                      * 2> filename
                      * 2>filename
-                     * 
-                     * stdout append redirection cases(at most 1):
-                     * >> out_file
-                     * >>out_file
+                     * 2>> filename
+                     * 2>>filename
                      */
-                    int output_redirection_case = 0; /* regular stdout redirection */
+                    int output_redirection_case = WRONLY; /* stdout redirection */
                     if (rank > 0 &&
                         cmd[rank - 1] == '2' &&
                         (rank - 1 == 0 || isblank(cmd[rank - 2]))) {
                         /*
-                         * 2>&1
+                         * 2>err_file
                          * ^^^^
                          *  r
                          */
-                        output_redirection_case = 2; /* stderr redirection */
+                        output_redirection_case = ERR_WRONLY; /* stderr redirection */
                     }
 
                     if (rank + 1 < cmdlen && cmd[rank + 1] == '>') {
-                        if (output_redirection_case == 0) {
-                            rank += 2;
-                            output_redirection_case = 1; /* append stdout redirection */
+                        if (output_redirection_case == WRONLY) {
+                            output_redirection_case = APPEND; /* append stdout redirection */
                         } else { /* 2>>.. */
-                            parse_error('>');
-                            return -1;
+                            output_redirection_case = ERR_APPEND; /* append stderr redirection */
                         }
+                        rank += 2;
                     } else {
                         rank += 1;
                     }
@@ -184,8 +200,8 @@ int parse_command_no_pipe(const struct string_view* cmdfrag,
                     size_t len = next_arg(cmd + rank, cmdlen - rank, &sv);
                     if (len > 0 && skip_whitespaces(cmd + rank, len) < len) { /* next argument is not empty */
                         switch (output_redirection_case) {
-                            case 0: /* create write */
-                            case 1: /* append */
+                            case WRONLY: /* create write */
+                            case APPEND: /* append */
                                 if (output_count < output_max) {
                                     output_file = sv;
                                     output_count += 1;
@@ -195,10 +211,12 @@ int parse_command_no_pipe(const struct string_view* cmdfrag,
                                 }
                                 break;
 
-                            case 2: /* stderr redirection */
+                            case ERR_WRONLY: /* stderr redirection */
+                            case ERR_APPEND:
                                 /* no blanks in 2>&1 */
                                 if (len == sv.len && sv.len == 2 && strncmp(sv.str, "&1", 2) == 0) {
                                     stderr_to_stdout_flag = 1;
+                                    output_redirection_case = ERR_WRONLY; /* support 2>>&1 */
                                 }
 
                                 if (err_count < err_max) {
@@ -218,12 +236,27 @@ int parse_command_no_pipe(const struct string_view* cmdfrag,
                             default:
                                 assert(0 && "invalid output redirection case.");
                         }
-                        if (output_redirection_case == 0) {
-                            open_flag = O_WRONLY | O_CREAT;
-                        } else if (output_redirection_case == 1) {
-                            open_flag = O_APPEND;
-                        } else {
-                            /* nothing to do */
+
+                        switch (output_redirection_case) {
+                            case WRONLY:
+                                stdout_open_flag = O_WRONLY | O_CREAT;
+                                break;
+
+                            case ERR_WRONLY:
+                                stderr_open_flag = O_WRONLY | O_CREAT;
+                                break;
+
+                            case APPEND:
+                                stdout_open_flag = O_APPEND | O_CREAT;
+                                break;
+
+                            case ERR_APPEND:
+                                stderr_open_flag = O_APPEND | O_CREAT;
+                                break;
+
+                            default:
+                                assert(0 && "unreachable switch-case");
+                                break;
                         }
                     } else {
                         fprintf(stderr, "bsh: parse error near '>', empty input file.\n");
@@ -256,10 +289,13 @@ int parse_command_no_pipe(const struct string_view* cmdfrag,
     if (input_count) cmdref->stdinfile = input_file;
     if (output_count) {
         cmdref->stdoutfile = output_file;
-        cmdref->stdoutfile_openflag = open_flag;
+        cmdref->stdoutfile_openflag = stdout_open_flag;
+    }
+    if (err_count) {
+        cmdref->stderrfile = err_file;
+        cmdref->stderrfile_openflag = stderr_open_flag;
     }
     cmdref->stderr_to_stdout_flag = stderr_to_stdout_flag;
-    if (err_count) cmdref->stderrfile = err_file;
     for (size_t i = 0; i < argrank; i++) {
         cmdref->arguments[i].str = argfrags[i].str;
         cmdref->arguments[i].len = argfrags[i].len;
@@ -380,11 +416,13 @@ struct pipe_command* mk_pipecommand(const struct command_frag* cmdfrag) {
         (struct pipe_command*)malloc(sizeof(struct pipe_command));
     if (pcmd) {
         pcmd->stdinfd = open_file(&(cmdfrag->stdinfile), O_RDONLY);
-        pcmd->stdoutfd = open_file(&(cmdfrag->stdoutfile), cmdfrag->stdoutfile_openflag);
+        pcmd->stdoutfd = open_file(&(cmdfrag->stdoutfile),
+                                   cmdfrag->stdoutfile_openflag);
         if (cmdfrag->stderr_to_stdout_flag == 1) {
             pcmd->stderrfd = 1;
         } else {
-            pcmd->stderrfd = open_file(&(cmdfrag->stderrfile), O_WRONLY | O_CREAT);
+            pcmd->stderrfd = open_file(&(cmdfrag->stderrfile),
+                                       cmdfrag->stderrfile_openflag);
         }
 
         size_t i = 0;
